@@ -1,7 +1,8 @@
 [package]
 name = "p8ster"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+publish = false
 description = "A slow, polite, single-threaded pastebin.com scraper"
 
 [dependencies]
@@ -9,6 +10,7 @@ ureq = "3.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 fastrand = "2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 lto = true

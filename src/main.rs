@@ -1,8 +1,9 @@
 //! p8ster: a slow, polite, single-threaded pastebin.com scraper.
 //!
 //! Usage:
-//!   p8ster              guess random IDs forever
-//!   p8ster ID [ID...]   scrape just these IDs, then exit
+//!   p8ster              guess random 6-char IDs forever
+//!   p8ster -l 8         guess random 8-char IDs forever (6, 7 or 8)
+//!   p8ster ID [ID...]   scrape just these IDs (any supported length), then exit
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -11,12 +12,16 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDateTime, TimeDelta};
+use clap::Parser;
 use rusqlite::{Connection, OptionalExtension, params};
 
 const BASE_URL: &str = "https://pastebin.com";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:157.0) Gecko/20100101 Firefox/157.0";
-const ID_LEN: usize = 8;
+/// Pastebin ID lengths over the years: 6 (oldest), then 7, now 8.
+const ID_LEN_MIN: usize = 6;
+const ID_LEN_MAX: usize = 8;
+const ID_LEN_DEFAULT: u8 = 6;
 const DELAY_MIN_MS: u64 = 1001;
 const DELAY_MAX_MS: u64 = 1111;
 /// Pause after the 1st, 2nd, 3rd... consecutive 429. The last value repeats.
@@ -25,10 +30,26 @@ const MAX_BODY_BYTES: u64 = 32 * 1024 * 1024;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pastes (
-    id      VARCHAR(8) NOT NULL PRIMARY KEY CHECK (length(id) = 8),
+    id      VARCHAR(8) NOT NULL PRIMARY KEY CHECK (length(id) BETWEEN 6 AND 8),
     date    DATETIME   NULL DEFAULT NULL,
     content TEXT       NULL DEFAULT NULL
 );";
+
+// ------------------------------------------------------------------- cli
+
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Length of randomly guessed IDs
+    #[arg(short = 'l', long = "length", value_name = "LEN",
+          default_value_t = ID_LEN_DEFAULT,
+          value_parser = clap::value_parser!(u8).range(ID_LEN_MIN as i64..=ID_LEN_MAX as i64))]
+    length: u8,
+
+    /// Scrape just these IDs, then exit
+    #[arg(value_name = "ID")]
+    ids: Vec<String>,
+}
 
 // ---------------------------------------------------------------- output
 
@@ -81,11 +102,40 @@ fn db_path() -> Result<PathBuf, String> {
 
 fn open_db(path: &Path) -> Result<Connection, String> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    let conn = Connection::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    conn.execute_batch(SCHEMA).map_err(|e| format!("cannot create schema: {e}"))?;
+    let conn =
+        Connection::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    migrate_id_check(&conn).map_err(|e| format!("cannot migrate schema: {e}"))?;
+    conn.execute_batch(SCHEMA)
+        .map_err(|e| format!("cannot create schema: {e}"))?;
     Ok(conn)
+}
+
+/// Databases created before variable-length IDs have `CHECK (length(id) = 8)`,
+/// which rejects 6- and 7-char IDs. SQLite can't alter a CHECK in place, so
+/// rebuild the table with the current schema and copy every row across.
+fn migrate_id_check(conn: &Connection) -> rusqlite::Result<()> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pastes'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if !sql.is_some_and(|s| s.contains("length(id) = 8")) {
+        return Ok(());
+    }
+    info("migrating database to allow 6-8 char IDs");
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("ALTER TABLE pastes RENAME TO pastes_old;")?;
+    tx.execute_batch(SCHEMA)?;
+    tx.execute_batch(
+        "INSERT INTO pastes (id, date, content) SELECT id, date, content FROM pastes_old;
+         DROP TABLE pastes_old;",
+    )?;
+    tx.commit()
 }
 
 fn row_state(conn: &Connection, id: &str) -> rusqlite::Result<RowState> {
@@ -114,7 +164,12 @@ fn mark_dead(conn: &Connection, id: &str) -> rusqlite::Result<()> {
 }
 
 /// Write content and date together, in one statement, once both are known.
-fn save_paste(conn: &Connection, id: &str, content: &str, date: Option<&str>) -> rusqlite::Result<()> {
+fn save_paste(
+    conn: &Connection,
+    id: &str,
+    content: &str,
+    date: Option<&str>,
+) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO pastes (id, date, content) VALUES (?1, ?2, ?3)
          ON CONFLICT(id) DO UPDATE SET date = excluded.date, content = excluded.content",
@@ -124,8 +179,11 @@ fn save_paste(conn: &Connection, id: &str, content: &str, date: Option<&str>) ->
 }
 
 fn partial_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM pastes WHERE date IS NULL AND content IS NOT NULL")?;
-    let ids = stmt.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+    let mut stmt =
+        conn.prepare("SELECT id FROM pastes WHERE date IS NULL AND content IS NOT NULL")?;
+    let ids = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
     Ok(ids)
 }
 
@@ -175,7 +233,10 @@ impl Client {
                 .agent
                 .get(url)
                 .header("User-Agent", USER_AGENT)
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .header(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
                 .header("Accept-Language", "en-US,en;q=0.5")
                 .call();
             self.last_request = Some(Instant::now());
@@ -206,7 +267,11 @@ impl Client {
             if status != 200 {
                 return Ok(Fetch::Status(status));
             }
-            let bytes = resp.body_mut().with_config().limit(MAX_BODY_BYTES).read_to_vec()?;
+            let bytes = resp
+                .body_mut()
+                .with_config()
+                .limit(MAX_BODY_BYTES)
+                .read_to_vec()?;
             self.last_request = Some(Instant::now());
             return Ok(Fetch::Body(String::from_utf8_lossy(&bytes).into_owned()));
         }
@@ -255,17 +320,17 @@ fn parse_pastebin_date(title: &str) -> Option<String> {
 
 // --------------------------------------------------------------- scraping
 
-fn random_id() -> String {
-    (0..ID_LEN).map(|_| fastrand::alphanumeric()).collect()
+fn random_id(len: usize) -> String {
+    (0..len).map(|_| fastrand::alphanumeric()).collect()
 }
 
 fn valid_id(id: &str) -> bool {
-    id.len() == ID_LEN && id.bytes().all(|b| b.is_ascii_alphanumeric())
+    (ID_LEN_MIN..=ID_LEN_MAX).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-fn next_id(conn: &Connection) -> rusqlite::Result<String> {
+fn next_id(conn: &Connection, len: usize) -> rusqlite::Result<String> {
     loop {
-        let id = random_id();
+        let id = random_id(len);
         match row_state(conn, &id)? {
             RowState::Unseen | RowState::Partial => return Ok(id),
             RowState::Dead | RowState::Done => info(format!("{id} already in database, rerolling")),
@@ -306,11 +371,15 @@ fn fetch_date(client: &mut Client, id: &str, tag: &str) -> Option<Option<String>
     let html = match client.get(&format!("{BASE_URL}/{id}")) {
         Ok(Fetch::Body(html)) => html,
         Ok(Fetch::Status(code)) => {
-            bad(format!("{tag}  paste page returned HTTP {code} (not recorded)"));
+            bad(format!(
+                "{tag}  paste page returned HTTP {code} (not recorded)"
+            ));
             return None;
         }
         Err(e) => {
-            bad(format!("{tag}  network error on paste page: {e} (not recorded)"));
+            bad(format!(
+                "{tag}  network error on paste page: {e} (not recorded)"
+            ));
             return None;
         }
     };
@@ -324,6 +393,7 @@ fn fetch_date(client: &mut Client, id: &str, tag: &str) -> Option<Option<String>
 }
 
 fn main() {
+    let cli = Cli::parse();
     let path = match db_path() {
         Ok(p) => p,
         Err(e) => {
@@ -348,13 +418,14 @@ fn main() {
     let mut client = Client::new();
 
     // Explicit IDs on the command line: scrape those and exit.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.is_empty() {
-        for id in &args {
+    if !cli.ids.is_empty() {
+        for id in &cli.ids {
             if valid_id(id) {
                 scrape(&conn, &mut client, id, id);
             } else {
-                bad(format!("{id}  invalid ID (need {ID_LEN} chars of 0-9a-zA-Z)"));
+                bad(format!(
+                    "{id}  invalid ID (need {ID_LEN_MIN}-{ID_LEN_MAX} chars of 0-9a-zA-Z)"
+                ));
             }
         }
         return;
@@ -374,7 +445,7 @@ fn main() {
 
     let mut n: u64 = 0;
     loop {
-        let id = match next_id(&conn) {
+        let id = match next_id(&conn, cli.length as usize) {
             Ok(id) => id,
             Err(e) => {
                 bad(format!("database error: {e}"));
